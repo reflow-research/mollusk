@@ -204,6 +204,13 @@ impl Sysvars {
         &self,
         accounts: &[(Pubkey, Account)],
     ) -> Option<SysvarCache> {
+        self.maybe_override_sysvar_cache_generic(accounts)
+    }
+
+    pub(crate) fn maybe_override_sysvar_cache_generic<A: ReadableAccount>(
+        &self,
+        accounts: &[(Pubkey, A)],
+    ) -> Option<SysvarCache> {
         // Check if any provided accounts are sysvar overrides.
         let has_sysvar_override = accounts.iter().any(|(key, _)| {
             key.eq(&Clock::id())

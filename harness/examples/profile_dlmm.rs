@@ -7,7 +7,7 @@
 //!   cargo run --example profile_dlmm --release
 
 use mollusk_svm::Mollusk;
-use solana_account::Account;
+use solana_account::{Account, AccountSharedData};
 use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
@@ -114,10 +114,22 @@ fn load_elf(relative: &str) -> Vec<u8> {
 }
 
 fn main() {
-    let (instruction, accounts, slot, epoch, unix_timestamp) = load_fixture();
+    let (instruction, mut accounts, slot, epoch, unix_timestamp) = load_fixture();
+
+    if std::env::var_os("MOLLUSK_DROP_EXECUTABLE_INPUT_ACCOUNTS").is_some() {
+        accounts.retain(|(_, account)| !account.executable);
+    }
 
     let loader = Pubkey::from_str("BPFLoaderUpgradeab1e11111111111111111111111").unwrap();
     let mut mollusk = Mollusk::default();
+
+    if std::env::var_os("MOLLUSK_DISABLE_STRICTER_ABI").is_some() {
+        mollusk
+            .feature_set
+            .active_mut()
+            .remove(&agave_feature_set::stricter_abi_and_runtime_constraints::id());
+        mollusk.rebuild_runtime_environments();
+    }
 
     mollusk.sysvars.warp_to_slot(slot);
     mollusk.sysvars.clock.epoch = epoch;
@@ -141,24 +153,43 @@ fn main() {
     solana_logger::setup_with("");
 
     // Warmup
+    let shared_accounts: Vec<(Pubkey, AccountSharedData)> = accounts
+        .iter()
+        .map(|(k, a)| (*k, AccountSharedData::from(a.clone())))
+        .collect();
+    let use_shared_accounts = std::env::var_os("MOLLUSK_USE_SHARED_ACCOUNTS").is_some();
+
     for _ in 0..50 {
-        let _ = mollusk.process_instruction(&instruction, &accounts);
+        let _ = if use_shared_accounts {
+            mollusk.process_instruction_shared_no_resulting_accounts(&instruction, &shared_accounts)
+        } else {
+            mollusk.process_instruction(&instruction, &accounts)
+        };
     }
 
     // Collect per-iteration data
     let mut wall_times = Vec::with_capacity(ITERATIONS);
     let mut svm_exec_times = Vec::with_capacity(ITERATIONS);
     let mut compute_units = Vec::with_capacity(ITERATIONS);
+    let mut breakdowns = Vec::with_capacity(ITERATIONS);
 
     for _ in 0..ITERATIONS {
         let start = Instant::now();
-        let result = mollusk.process_instruction(&instruction, &accounts);
+        let (result, breakdown) = if use_shared_accounts {
+            mollusk.process_instruction_shared_profiled(&instruction, &shared_accounts)
+        } else {
+            (
+                mollusk.process_instruction(&instruction, &accounts),
+                mollusk_svm::SimulationTimingBreakdown::default(),
+            )
+        };
         let wall = start.elapsed();
 
         assert!(result.program_result.is_ok());
         wall_times.push(wall.as_nanos() as u64);
         svm_exec_times.push(result.execution_time); // in microseconds from SVM
         compute_units.push(result.compute_units_consumed);
+        breakdowns.push(breakdown);
     }
 
     // Statistics
@@ -177,6 +208,7 @@ fn main() {
     let harness_mean = wall_mean.saturating_sub(svm_mean * 1000);
 
     let cu = compute_units[0];
+    let profiled = use_shared_accounts;
 
     // Account data analysis
     let total_data: usize = accounts.iter().map(|(_, a)| a.data.len()).sum();
@@ -217,6 +249,55 @@ fn main() {
     println!("Harness (mollusk overhead):                 {:>5.1}%  ({:.1} µs)",
         harness_pct, harness_median as f64 / 1000.0);
     println!();
+
+    if profiled {
+        breakdowns.sort_by_key(|b| b.process_message_us);
+        let mid = &breakdowns[ITERATIONS / 2];
+        println!("--- Harness Phase Medians ---");
+        println!();
+        println!("fallback_accounts:        {:>8} µs", mid.fallback_accounts_us);
+        println!("compile_accounts:         {:>8} µs", mid.compile_accounts_us);
+        println!(
+            "create_transaction_ctx:   {:>8} µs",
+            mid.create_transaction_context_us
+        );
+        println!("sysvar_override:          {:>8} µs", mid.sysvar_override_us);
+        println!("process_message_total:    {:>8} µs", mid.process_message_us);
+        println!("  prepare_instruction:    {:>8} µs", mid.prepare_instruction_us);
+        println!("  invoke_instruction:     {:>8} µs", mid.invoke_instruction_us);
+        println!("  serialize:              {:>8} µs", mid.serialize_us);
+        println!("  create_vm:              {:>8} µs", mid.create_vm_us);
+        println!("  execute_detail:         {:>8} µs", mid.execute_detail_us);
+        println!(
+            "  get_or_create_executor: {:>8} µs",
+            mid.get_or_create_executor_us
+        );
+        println!("  deserialize:            {:>8} µs", mid.deserialize_us);
+        println!(
+            "  process_exec_chain:     {:>8} µs",
+            mid.process_executable_chain_us
+        );
+        println!(
+            "  process_msg_accessory:  {:>8} µs",
+            mid.process_message_accessory_us
+        );
+        println!(
+            "  process_instr_total:    {:>8} µs",
+            mid.process_instruction_total_us
+        );
+        println!("  verify_caller:          {:>8} µs", mid.verify_caller_us);
+        println!("  verify_callee:          {:>8} µs", mid.verify_callee_us);
+        println!();
+
+        let mut program_timings = mid.per_program_timings.clone();
+        program_timings.sort_by(|a, b| b.1.cmp(&a.1));
+        println!("--- Program Timings ---");
+        println!();
+        for (pubkey, us, cus, count) in program_timings.iter().take(8) {
+            println!("{pubkey}: {:>6} µs  {:>6} CUs  count {}", us, cus, count);
+        }
+        println!();
+    }
 
     // Per-account data sizes
     println!("--- Account Data Sizes ---");
