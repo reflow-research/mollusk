@@ -490,7 +490,7 @@ use {
     solana_pubkey::Pubkey,
     solana_svm_callback::InvokeContextCallback,
     solana_svm_log_collector::LogCollector,
-    solana_svm_timings::ExecuteTimings,
+    solana_svm_timings::{ExecuteDetailsTimings, ExecuteTimings},
     solana_svm_transaction::instruction::SVMInstruction,
     solana_transaction_context::{IndexOfAccount, TransactionContext},
     solana_transaction_error::TransactionError,
@@ -500,6 +500,7 @@ use {
         iter::once,
         rc::Rc,
         sync::Arc,
+        time::Instant,
     },
 };
 #[cfg(feature = "inner-instructions")]
@@ -689,6 +690,19 @@ struct MessageResult {
     pub execution_time: u64,
     /// The raw result of the transaction's execution.
     pub raw_result: Result<(), TransactionError>,
+    pub serialize_time: u64,
+    pub create_vm_time: u64,
+    pub execute_detail_time: u64,
+    pub get_or_create_executor_time: u64,
+    pub deserialize_time: u64,
+    pub prepare_instruction_time: u64,
+    pub invoke_instruction_time: u64,
+    pub process_executable_chain_time: u64,
+    pub process_message_accessory_time: u64,
+    pub process_instruction_total_time: u64,
+    pub verify_caller_time: u64,
+    pub verify_callee_time: u64,
+    pub per_program_timings: Vec<(Pubkey, u64, u64, u32)>,
     /// The return data produced by the transaction, if any.
     pub return_data: Vec<u8>,
     /// Inner instructions (CPIs) invoked during the transaction execution.
@@ -707,6 +721,29 @@ struct MessageResult {
     /// fixtures don't contain the compiled message.
     #[cfg(feature = "inner-instructions")]
     pub message: Option<SanitizedMessage>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SimulationTimingBreakdown {
+    pub fallback_accounts_us: u64,
+    pub compile_accounts_us: u64,
+    pub create_transaction_context_us: u64,
+    pub sysvar_override_us: u64,
+    pub process_message_us: u64,
+    pub prepare_instruction_us: u64,
+    pub invoke_instruction_us: u64,
+    pub deconstruct_resulting_accounts_us: u64,
+    pub serialize_us: u64,
+    pub create_vm_us: u64,
+    pub execute_detail_us: u64,
+    pub get_or_create_executor_us: u64,
+    pub deserialize_us: u64,
+    pub process_executable_chain_us: u64,
+    pub process_message_accessory_us: u64,
+    pub process_instruction_total_us: u64,
+    pub verify_caller_us: u64,
+    pub verify_callee_us: u64,
+    pub per_program_timings: Vec<(Pubkey, u64, u64, u32)>,
 }
 
 impl MessageResult {
@@ -736,6 +773,10 @@ impl MessageResult {
 }
 
 impl Mollusk {
+    fn should_skip_resulting_accounts() -> bool {
+        std::env::var_os("MOLLUSK_SKIP_RESULTING_ACCOUNTS").is_some()
+    }
+
     fn build_program_runtime_environments(
         feature_set: &FeatureSet,
         compute_budget: &ComputeBudget,
@@ -944,12 +985,14 @@ impl Mollusk {
     }
 
     // Determine the accounts to fallback to during account compilation.
-    fn get_account_fallbacks<'a>(
+    fn get_account_fallbacks<'a, A: ReadableAccount>(
         &self,
         all_program_ids: impl Iterator<Item = &'a Pubkey>,
         all_instructions: impl Iterator<Item = &'a Instruction>,
-        accounts: &[(Pubkey, Account)],
+        accounts: &[(Pubkey, A)],
     ) -> HashMap<Pubkey, Account> {
+        let all_instructions: Vec<&Instruction> = all_instructions.collect();
+
         // Use a HashSet for fast lookups.
         let account_keys: HashSet<&Pubkey> = accounts.iter().map(|(key, _)| key).collect();
 
@@ -957,8 +1000,9 @@ impl Mollusk {
 
         // Top-level target programs.
         all_program_ids.for_each(|program_id| {
-            if !account_keys.contains(program_id) {
-                // Fallback to a stub.
+            if crate::program::precompile_keys::is_precompile(program_id)
+                || self.program_cache.load_program(program_id).is_some()
+            {
                 fallbacks.insert(
                     *program_id,
                     Account {
@@ -970,11 +1014,36 @@ impl Mollusk {
             }
         });
 
+        // Cached program accounts referenced directly by instruction metas, for
+        // example CPI targets like SPL Token or Memo. These do not need their
+        // full on-chain account data in the transaction account list because
+        // Mollusk already has the executable loaded in the program cache.
+        all_instructions.iter().copied().for_each(|instruction| {
+            instruction.accounts.iter().for_each(|account_meta| {
+                let pubkey = account_meta.pubkey;
+                if fallbacks.contains_key(&pubkey) {
+                    return;
+                }
+                if crate::program::precompile_keys::is_precompile(&pubkey)
+                    || self.program_cache.load_program(&pubkey).is_some()
+                {
+                    fallbacks.insert(
+                        pubkey,
+                        Account {
+                            owner: self.get_loader_key(&pubkey),
+                            executable: true,
+                            ..Default::default()
+                        },
+                    );
+                }
+            });
+        });
+
         // Instructions sysvar.
         if !account_keys.contains(&solana_instructions_sysvar::ID) {
             // Fallback to the actual implementation of the sysvar.
             let (ix_sysvar_id, ix_sysvar_acct) =
-                crate::instructions_sysvar::keyed_account(all_instructions);
+                crate::instructions_sysvar::keyed_account(all_instructions.iter().copied());
             fallbacks.insert(ix_sysvar_id, ix_sysvar_acct);
         }
 
@@ -1071,6 +1140,8 @@ impl Mollusk {
     ) -> MessageResult {
         let mut compute_units_consumed = 0;
         let mut timings = ExecuteTimings::default();
+        let mut prepare_instruction_time = 0u64;
+        let mut invoke_instruction_time = 0u64;
 
         let mut program_cache = self.program_cache.cache();
         let callback = MolluskInvokeContextCallback {
@@ -1104,6 +1175,7 @@ impl Mollusk {
         {
             let program_id_index = compiled_ix.program_id_index as IndexOfAccount;
 
+            let prepare_start = Instant::now();
             invoke_context
                 .prepare_next_top_level_instruction(
                     sanitized_message,
@@ -1112,6 +1184,7 @@ impl Mollusk {
                     &compiled_ix.data,
                 )
                 .expect("failed to prepare instruction");
+            prepare_instruction_time += prepare_start.elapsed().as_micros() as u64;
 
             #[cfg(feature = "invocation-inspect-callback")]
             {
@@ -1130,6 +1203,7 @@ impl Mollusk {
             }
 
             let mut compute_units_consumed_instruction = 0u64;
+            let invoke_start = Instant::now();
             let invoke_result = if invoke_context.is_precompile(program_id) {
                 invoke_context.process_precompile(
                     program_id,
@@ -1140,7 +1214,11 @@ impl Mollusk {
                 invoke_context
                     .process_instruction(&mut compute_units_consumed_instruction, &mut timings)
             };
+            invoke_instruction_time += invoke_start.elapsed().as_micros() as u64;
             compute_units_consumed += compute_units_consumed_instruction;
+
+            timings.details.accumulate(&invoke_context.timings);
+            invoke_context.timings = ExecuteDetailsTimings::default();
 
             #[cfg(feature = "invocation-inspect-callback")]
             self.invocation_inspect_callback.after_invocation(
@@ -1158,6 +1236,12 @@ impl Mollusk {
             }
         }
 
+        let execution_time = timings.details.execute_us.0;
+        let serialize_time = timings.details.serialize_us.0;
+        let create_vm_time = timings.details.create_vm_us.0;
+        let get_or_create_executor_time = timings.details.get_or_create_executor_us.0;
+        let deserialize_time = timings.details.deserialize_us.0;
+
         let return_data = transaction_context.get_return_data().1.to_vec();
 
         #[cfg(feature = "inner-instructions")]
@@ -1165,8 +1249,49 @@ impl Mollusk {
 
         MessageResult {
             compute_units_consumed,
-            execution_time: timings.details.execute_us.0,
+            execution_time,
             raw_result,
+            serialize_time,
+            create_vm_time,
+            execute_detail_time: execution_time,
+            get_or_create_executor_time,
+            deserialize_time,
+            prepare_instruction_time,
+            invoke_instruction_time,
+            process_executable_chain_time: timings
+                .execute_accessories
+                .process_instructions
+                .process_executable_chain_us
+                .0,
+            process_message_accessory_time: timings.execute_accessories.process_message_us.0,
+            process_instruction_total_time: timings
+                .execute_accessories
+                .process_instructions
+                .total_us
+                .0,
+            verify_caller_time: timings
+                .execute_accessories
+                .process_instructions
+                .verify_caller_us
+                .0,
+            verify_callee_time: timings
+                .execute_accessories
+                .process_instructions
+                .verify_callee_us
+                .0,
+            per_program_timings: timings
+                .details
+                .per_program_timings
+                .iter()
+                .map(|(pubkey, timing)| {
+                    (
+                        *pubkey,
+                        timing.accumulated_us.0,
+                        timing.accumulated_units.0,
+                        timing.count.0,
+                    )
+                })
+                .collect(),
             return_data,
             #[cfg(feature = "inner-instructions")]
             inner_instructions,
@@ -1199,7 +1324,9 @@ impl Mollusk {
             sysvar_cache,
         );
 
-        let resulting_accounts = if message_result.raw_result.is_ok() {
+        let resulting_accounts = if Self::should_skip_resulting_accounts() {
+            Vec::new()
+        } else if message_result.raw_result.is_ok() {
             Self::deconstruct_resulting_accounts(&transaction_context, accounts)
         } else {
             accounts.to_vec()
@@ -1281,7 +1408,9 @@ impl Mollusk {
             &sysvar_cache,
         );
 
-        let resulting_accounts = if message_result.raw_result.is_ok() {
+        let resulting_accounts = if Self::should_skip_resulting_accounts() {
+            Vec::new()
+        } else if message_result.raw_result.is_ok() {
             Self::deconstruct_resulting_accounts(&transaction_context, accounts)
         } else {
             accounts.to_vec()
@@ -1312,6 +1441,146 @@ impl Mollusk {
         fuzz::generate_fixtures_from_mollusk_test(self, instruction, accounts, &result);
 
         result
+    }
+
+    /// Process an instruction using prebuilt `AccountSharedData` inputs and
+    /// skip resulting-account materialization.
+    pub fn process_instruction_shared_no_resulting_accounts(
+        &self,
+        instruction: &Instruction,
+        accounts: &[(Pubkey, AccountSharedData)],
+    ) -> InstructionResult {
+        let fallback_accounts = self.get_account_fallbacks(
+            std::iter::once(&instruction.program_id),
+            std::iter::once(instruction),
+            accounts,
+        );
+
+        let (sanitized_message, transaction_accounts) =
+            crate::compile_accounts::compile_accounts_shared(
+                std::slice::from_ref(instruction),
+                accounts,
+                &fallback_accounts,
+                self.instruction_account_privilege_overrides,
+            );
+
+        let mut transaction_context = self.create_transaction_context(transaction_accounts);
+        let sysvar_cache_override = self.sysvars.maybe_override_sysvar_cache_generic(accounts);
+        let sysvar_cache = sysvar_cache_override.as_ref().unwrap_or(&self.sysvar_cache);
+
+        let message_result = self.process_transaction_message(
+            &sanitized_message,
+            &mut transaction_context,
+            &sysvar_cache,
+        );
+
+        let raw_result = message_result
+            .raw_result
+            .map_err(MessageResult::extract_ix_err);
+
+        InstructionResult {
+            compute_units_consumed: message_result.compute_units_consumed,
+            execution_time: message_result.execution_time,
+            program_result: raw_result.clone().into(),
+            raw_result,
+            return_data: message_result.return_data,
+            resulting_accounts: Vec::new(),
+            #[cfg(feature = "inner-instructions")]
+            inner_instructions: message_result
+                .inner_instructions
+                .into_iter()
+                .next()
+                .unwrap_or_default(),
+            #[cfg(feature = "inner-instructions")]
+            message: message_result.message,
+        }
+    }
+
+    pub fn process_instruction_shared_profiled(
+        &self,
+        instruction: &Instruction,
+        accounts: &[(Pubkey, AccountSharedData)],
+    ) -> (InstructionResult, SimulationTimingBreakdown) {
+        let fallback_start = Instant::now();
+        let fallback_accounts = self.get_account_fallbacks(
+            std::iter::once(&instruction.program_id),
+            std::iter::once(instruction),
+            accounts,
+        );
+        let fallback_accounts_us = fallback_start.elapsed().as_micros() as u64;
+
+        let compile_start = Instant::now();
+        let (sanitized_message, transaction_accounts) =
+            crate::compile_accounts::compile_accounts_shared(
+                std::slice::from_ref(instruction),
+                accounts,
+                &fallback_accounts,
+                self.instruction_account_privilege_overrides,
+            );
+        let compile_accounts_us = compile_start.elapsed().as_micros() as u64;
+
+        let tx_context_start = Instant::now();
+        let mut transaction_context = self.create_transaction_context(transaction_accounts);
+        let create_transaction_context_us = tx_context_start.elapsed().as_micros() as u64;
+
+        let sysvar_override_start = Instant::now();
+        let sysvar_cache_override = self.sysvars.maybe_override_sysvar_cache_generic(accounts);
+        let sysvar_cache = sysvar_cache_override.as_ref().unwrap_or(&self.sysvar_cache);
+        let sysvar_override_us = sysvar_override_start.elapsed().as_micros() as u64;
+
+        let process_message_start = Instant::now();
+        let message_result = self.process_transaction_message(
+            &sanitized_message,
+            &mut transaction_context,
+            &sysvar_cache,
+        );
+        let process_message_us = process_message_start.elapsed().as_micros() as u64;
+
+        let raw_result = message_result
+            .raw_result
+            .map_err(MessageResult::extract_ix_err);
+
+        let result = InstructionResult {
+            compute_units_consumed: message_result.compute_units_consumed,
+            execution_time: message_result.execution_time,
+            program_result: raw_result.clone().into(),
+            raw_result,
+            return_data: message_result.return_data,
+            resulting_accounts: Vec::new(),
+            #[cfg(feature = "inner-instructions")]
+            inner_instructions: message_result
+                .inner_instructions
+                .into_iter()
+                .next()
+                .unwrap_or_default(),
+            #[cfg(feature = "inner-instructions")]
+            message: message_result.message,
+        };
+
+        (
+            result,
+            SimulationTimingBreakdown {
+                fallback_accounts_us,
+                compile_accounts_us,
+                create_transaction_context_us,
+                sysvar_override_us,
+                process_message_us,
+                prepare_instruction_us: message_result.prepare_instruction_time,
+                invoke_instruction_us: message_result.invoke_instruction_time,
+                deconstruct_resulting_accounts_us: 0,
+                serialize_us: message_result.serialize_time,
+                create_vm_us: message_result.create_vm_time,
+                execute_detail_us: message_result.execute_detail_time,
+                get_or_create_executor_us: message_result.get_or_create_executor_time,
+                deserialize_us: message_result.deserialize_time,
+                process_executable_chain_us: message_result.process_executable_chain_time,
+                process_message_accessory_us: message_result.process_message_accessory_time,
+                process_instruction_total_us: message_result.process_instruction_total_time,
+                verify_caller_us: message_result.verify_caller_time,
+                verify_callee_us: message_result.verify_callee_time,
+                per_program_timings: message_result.per_program_timings,
+            },
+        )
     }
 
     /// Process a chain of instructions using the minified Solana Virtual

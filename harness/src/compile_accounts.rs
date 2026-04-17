@@ -36,6 +36,25 @@ pub fn compile_accounts(
     (sanitized_message, transaction_accounts)
 }
 
+pub fn compile_accounts_shared(
+    instructions: &[Instruction],
+    accounts: &[(Pubkey, AccountSharedData)],
+    fallback_accounts: &HashMap<Pubkey, Account>,
+    privilege_overrides: InstructionAccountPrivilegeOverrides,
+) -> (SanitizedMessage, Vec<(Pubkey, AccountSharedData)>) {
+    let message = compile_message(instructions, privilege_overrides);
+    let sanitized_message = SanitizedMessage::Legacy(LegacyMessage::new(message, &EMPTY_HASHSET));
+
+    let transaction_accounts = build_transaction_accounts_shared(
+        &sanitized_message,
+        accounts,
+        instructions,
+        fallback_accounts,
+    );
+
+    (sanitized_message, transaction_accounts)
+}
+
 fn compile_message(
     instructions: &[Instruction],
     privilege_overrides: InstructionAccountPrivilegeOverrides,
@@ -174,6 +193,12 @@ fn build_transaction_accounts(
         .account_keys()
         .iter()
         .map(|key| {
+            if let Some(fallback) = fallback_accounts.get(key) {
+                if fallback.executable {
+                    return (*key, AccountSharedData::from(fallback.clone()));
+                }
+            }
+
             if program_ids.contains(key) {
                 if let Some(provided_account) = account_map.get(key) {
                     return (*key, AccountSharedData::from((*provided_account).clone()));
@@ -202,6 +227,66 @@ fn build_transaction_accounts(
             let account = account_map
                 .get(key)
                 .map(|a| AccountSharedData::from((*a).clone()))
+                .or_else(|| {
+                    fallback_accounts
+                        .get(key)
+                        .map(|a| AccountSharedData::from(a.clone()))
+                })
+                .or_panic_with(MolluskError::AccountMissing(key));
+
+            (*key, account)
+        })
+        .collect()
+}
+
+fn build_transaction_accounts_shared(
+    message: &SanitizedMessage,
+    accounts: &[(Pubkey, AccountSharedData)],
+    all_instructions: &[Instruction],
+    fallback_accounts: &HashMap<Pubkey, Account>,
+) -> Vec<(Pubkey, AccountSharedData)> {
+    let program_ids: HashSet<Pubkey> = all_instructions.iter().map(|ix| ix.program_id).collect();
+    let account_map: HashMap<&Pubkey, &AccountSharedData> =
+        accounts.iter().map(|(k, a)| (k, a)).collect();
+
+    message
+        .account_keys()
+        .iter()
+        .map(|key| {
+            if let Some(fallback) = fallback_accounts.get(key) {
+                if fallback.executable {
+                    return (*key, AccountSharedData::from(fallback.clone()));
+                }
+            }
+
+            if program_ids.contains(key) {
+                if let Some(provided_account) = account_map.get(key) {
+                    return (*key, (*provided_account).clone());
+                }
+                if let Some(fallback) = fallback_accounts.get(key) {
+                    return (*key, AccountSharedData::from(fallback.clone()));
+                }
+                let mut program_account = Account::default();
+                program_account.set_executable(true);
+                return (*key, program_account.into());
+            }
+
+            if *key == solana_instructions_sysvar::ID {
+                if let Some(provided_account) = account_map.get(key) {
+                    return (*key, (*provided_account).clone());
+                }
+                if let Some(fallback) = fallback_accounts.get(key) {
+                    return (*key, AccountSharedData::from(fallback.clone()));
+                }
+                let (_, account) =
+                    crate::instructions_sysvar::keyed_account(all_instructions.iter());
+                return (*key, account.into());
+            }
+
+            let account = account_map
+                .get(key)
+                .copied()
+                .cloned()
                 .or_else(|| {
                     fallback_accounts
                         .get(key)

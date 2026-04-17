@@ -144,7 +144,7 @@ impl ProgramCache {
                 .iter()
             {
                 let name = std::str::from_utf8(name).unwrap();
-                loader.register_function(name, value).unwrap();
+                loader.register_function_with_codegen(name, value).unwrap();
             }
 
             Arc::new(loader)

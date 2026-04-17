@@ -105,3 +105,24 @@ spl-associated-token-account-interface = "2.0.0"
 spl-token-interface = "2.0.0"
 thiserror = "2.0.17"
 tokio = "1.51.0"
+
+[patch.crates-io]
+agave-feature-set = { path = "/home/sol/salsa-i-hate-sigverify/feature-set" }
+agave-syscalls = { path = "/home/sol/salsa-i-hate-sigverify/syscalls" }
+solana-bpf-loader-program = { path = "/home/sol/salsa-i-hate-sigverify/programs/bpf_loader" }
+solana-compute-budget = { path = "/home/sol/salsa-i-hate-sigverify/compute-budget" }
+solana-compute-budget-program = { path = "/home/sol/salsa-i-hate-sigverify/programs/compute-budget" }
+solana-curve25519 = { path = "/home/sol/salsa-i-hate-sigverify/curves/curve25519" }
+solana-loader-v4-program = { path = "/home/sol/salsa-i-hate-sigverify/programs/loader-v4" }
+solana-poseidon = { path = "/home/sol/salsa-i-hate-sigverify/poseidon" }
+solana-program-runtime = { path = "/home/sol/salsa-i-hate-sigverify/program-runtime" }
+solana-svm-callback = { path = "/home/sol/salsa-i-hate-sigverify/svm-callback" }
+solana-svm-feature-set = { path = "/home/sol/salsa-i-hate-sigverify/svm-feature-set" }
+solana-svm-log-collector = { path = "/home/sol/salsa-i-hate-sigverify/svm-log-collector" }
+solana-svm-measure = { path = "/home/sol/salsa-i-hate-sigverify/svm-measure" }
+solana-svm-timings = { path = "/home/sol/salsa-i-hate-sigverify/svm-timings" }
+solana-svm-transaction = { path = "/home/sol/salsa-i-hate-sigverify/svm-transaction" }
+solana-svm-type-overrides = { path = "/home/sol/salsa-i-hate-sigverify/svm-type-overrides" }
+solana-transaction-context = { path = "/home/sol/salsa-i-hate-sigverify/transaction-context" }
+solana-vote-program = { path = "/home/sol/salsa-i-hate-sigverify/programs/vote" }
+solana-zk-elgamal-proof-program = { path = "/home/sol/salsa-i-hate-sigverify/programs/zk-elgamal-proof" }
